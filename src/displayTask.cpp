@@ -6,18 +6,6 @@
 // Initialize LCD
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
-/**
- * @brief Display Task - Update LCD and Serial output
- * Priority: LOW (1)
- * Period: 250ms
- * 
- * Workflow:
- * 1. Receive event log from eventLogQueue
- * 2. Format display message
- * 3. Update LCD with message
- * 4. Print to Serial Monitor with mutex protection
- * 5. Debounce duplicate events within 100ms
- */
 void vDisplayTask(void *pvParameters) {
     EventLog eventLog;
     BaseType_t xStatus;
@@ -84,7 +72,8 @@ void vDisplayTask(void *pvParameters) {
 
                 default:
                     snprintf(lcd_line1, 17, "STATUS: %d", eventLog.type);
-                    snprintf(lcd_line2, 17, eventLog.message);
+                    // FIXED: format string protection added
+                    snprintf(lcd_line2, 17, "%s", eventLog.message); 
                     break;
             }
 

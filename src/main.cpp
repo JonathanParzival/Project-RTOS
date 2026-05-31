@@ -1,8 +1,8 @@
 #include <Arduino.h>
-#include <FreeRTOS.h>
-#include <task.h>
-#include <queue.h>
-#include <semphr.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <Wire.h>
@@ -28,8 +28,8 @@ SemaphoreHandle_t rfidReadSemaphore = NULL;
 SemaphoreHandle_t wifiConnectedSemaphore = NULL;
 
 // Mutexes
-MutexHandle_t databaseMutex = NULL;
-MutexHandle_t serialMutex = NULL;
+SemaphoreHandle_t databaseMutex = NULL;
+SemaphoreHandle_t serialMutex = NULL;
 
 // Databases & State
 UIDDatabase uidDatabase;

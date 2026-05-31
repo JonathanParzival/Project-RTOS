@@ -1,28 +1,9 @@
 #include "tasks.h"
 #include "config.h"
 #include "security.h"
+#include "spiffs.h"
 #include <Arduino.h>
 
-/**
- * @brief Authentication Task - Verify UID and calculate rolling token
- * Priority: HIGH (3)
- * Period: 100ms
- * 
- * Workflow:
- * 1. Receive UID from rfidDataQueue (from Input Task)
- * 2. Acquire databaseMutex
- * 3. Verify UID against database
- * 4. If valid:
- *    - Calculate rolling token (new UID)
- *    - Update database with new UID
- *    - Give feedback (GREEN LED + beep)
- *    - Queue rolling token update to Comm Task
- * 5. If invalid:
- *    - Give failure feedback (RED LED + error beep)
- *    - Record failed attempt in Security Task
- * 6. Generate event log
- * 7. Release databaseMutex
- */
 void vAuthTask(void *pvParameters) {
     RFIDData rfidData;
     RollingTokenUpdate rollingUpdate;
@@ -37,34 +18,24 @@ void vAuthTask(void *pvParameters) {
     xSemaphoreGive(serialMutex);
 
     while (1) {
-        // Wait for UID from Input Task queue (100ms timeout)
         xStatus = xQueueReceive(rfidDataQueue, &rfidData, pdMS_TO_TICKS(100));
 
         if (xStatus == pdPASS) {
-            // Acquire database mutex (CRITICAL SECTION)
             if (xSemaphoreTake(databaseMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                 
-                // Verify UID against database
                 uid_index = verifyUID(rfidData.uid, &uidDatabase, &matchedEntry);
 
                 if (uid_index >= 0) {
-                    // ✓ UID VALID - Proceed with Rolling Token update
                     uint8_t new_uid[4];
                     
-                    // Calculate rolling token
                     if (calculateRollingToken(rfidData.uid, new_uid) == 0) {
-                        // Update database with new UID
                         if (updateUIDInDatabase(&uidDatabase, uid_index, new_uid) == 0) {
-                            // Save updated database to SPIFFS
                             saveUIDsToFile(&uidDatabase, SPIFFS_UID_FILE);
 
-                            // Release mutex before long operations
                             xSemaphoreGive(databaseMutex);
 
-                            // FEEDBACK: Green LED + Beep
                             feedbackSuccess();
 
-                            // Queue rolling token update to Comm Task
                             rollingUpdate.timestamp = rfidData.timestamp;
                             uidCopy(rfidData.uid, rollingUpdate.old_uid);
                             uidCopy(new_uid, rollingUpdate.new_uid);
@@ -72,7 +43,6 @@ void vAuthTask(void *pvParameters) {
 
                             xQueueSend(rollingTokenQueue, &rollingUpdate, pdMS_TO_TICKS(10));
 
-                            // Create success event log
                             eventLog.type = EVENT_ACCESS_GRANTED;
                             eventLog.timestamp = rfidData.timestamp;
                             eventLog.result = 1;
@@ -91,7 +61,6 @@ void vAuthTask(void *pvParameters) {
                                           new_uid[0], new_uid[1], new_uid[2], new_uid[3]);
                             xSemaphoreGive(serialMutex);
 
-                            // Clear failed attempts (successful access resets counter)
                             clearFailedAttempts(&securityState);
 
                         } else {
@@ -117,16 +86,11 @@ void vAuthTask(void *pvParameters) {
                         xQueueSend(eventLogQueue, &eventLog, pdMS_TO_TICKS(10));
                     }
                 } else {
-                    // ✗ UID INVALID - Spoofing detected or unregistered
                     xSemaphoreGive(databaseMutex);
-                    
-                    // FEEDBACK: Red LED + Error beep
                     feedbackFailure();
 
-                    // Record failed attempt
                     int attempt_count = recordFailedAttempt(&securityState);
 
-                    // Create failure event log
                     eventLog.type = EVENT_SPOOFING_DETECTED;
                     eventLog.timestamp = rfidData.timestamp;
                     eventLog.result = 0;
@@ -145,7 +109,6 @@ void vAuthTask(void *pvParameters) {
                     Serial.printf("      Failed attempt: %d/%d\n", attempt_count, MAX_FAILED_ATTEMPTS);
                     xSemaphoreGive(serialMutex);
 
-                    // Check if system should be locked
                     if (isSystemLocked(&securityState)) {
                         feedbackLockout();
                         
@@ -161,14 +124,12 @@ void vAuthTask(void *pvParameters) {
                     }
                 }
             } else {
-                // Mutex acquire timeout
                 xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
                 Serial.println("[Auth] WARNING: Mutex timeout");
                 xSemaphoreGive(serialMutex);
             }
         }
 
-        // Periodic delay 100ms
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(AUTH_TASK_PERIOD));
     }
 }

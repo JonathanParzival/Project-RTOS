@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "security.h"
 #include "config.h"
 #include <stdio.h>

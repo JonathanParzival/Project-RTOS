@@ -1,21 +1,19 @@
 #include "comm.h"
 #include "config.h"
+#include "tasks.h"
+#include "spiffs.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Arduino.h>
 
-// Global MQTT client
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
-
-// ============ MQTT CONNECTION ============
 
 void initMQTT() {
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(onMQTTMessage);
     
-    // Try initial connection
     if (WiFi.status() == WL_CONNECTED) {
         reconnectMQTT();
     }
@@ -26,13 +24,9 @@ int isMQTTConnected() {
 }
 
 int reconnectMQTT() {
-    if (!WiFi.isConnected()) {
-        return -1;  // WiFi not connected
-    }
+    if (!WiFi.isConnected()) return -1;
 
-    // Try reconnect
     if (mqttClient.connect(MQTT_CLIENT_ID)) {
-        // Subscribe to topics
         subscribeMQTTTopics();
         return 0;
     }
@@ -43,24 +37,21 @@ void* getMQTTClient() {
     return &mqttClient;
 }
 
-// ============ MQTT PUBLISH OPERATIONS ============
+void loopMQTT() {
+    if (mqttClient.connected()) {
+        mqttClient.loop();
+    }
+}
 
 int publishRollingTokenUpdate(RollingTokenUpdate *update) {
-    if (update == NULL || !mqttClient.connected()) {
-        return -1;
-    }
+    if (update == NULL || !mqttClient.connected()) return -1;
 
-    StaticJsonDocument<256> doc;
+    JsonDocument doc; // Updated for ArduinoJson v7
     char uid_hex[9];
     char new_uid_hex[9];
     
-    // Convert UID to hex strings
-    snprintf(uid_hex, 9, "%02X%02X%02X%02X",
-             update->old_uid[0], update->old_uid[1],
-             update->old_uid[2], update->old_uid[3]);
-    snprintf(new_uid_hex, 9, "%02X%02X%02X%02X",
-             update->new_uid[0], update->new_uid[1],
-             update->new_uid[2], update->new_uid[3]);
+    snprintf(uid_hex, 9, "%02X%02X%02X%02X", update->old_uid[0], update->old_uid[1], update->old_uid[2], update->old_uid[3]);
+    snprintf(new_uid_hex, 9, "%02X%02X%02X%02X", update->new_uid[0], update->new_uid[1], update->new_uid[2], update->new_uid[3]);
 
     doc["old_uid"] = uid_hex;
     doc["new_uid"] = new_uid_hex;
@@ -74,16 +65,12 @@ int publishRollingTokenUpdate(RollingTokenUpdate *update) {
 }
 
 int publishEventLog(EventLog *event) {
-    if (event == NULL || !mqttClient.connected()) {
-        return -1;
-    }
+    if (event == NULL || !mqttClient.connected()) return -1;
 
-    StaticJsonDocument<256> doc;
+    JsonDocument doc; // Updated for ArduinoJson v7
     char uid_hex[9];
 
-    snprintf(uid_hex, 9, "%02X%02X%02X%02X",
-             event->uid[0], event->uid[1],
-             event->uid[2], event->uid[3]);
+    snprintf(uid_hex, 9, "%02X%02X%02X%02X", event->uid[0], event->uid[1], event->uid[2], event->uid[3]);
 
     doc["type"] = event->type;
     doc["timestamp"] = event->timestamp;
@@ -99,11 +86,9 @@ int publishEventLog(EventLog *event) {
 }
 
 int publishUIDRegistration(UIDEntry *entry) {
-    if (entry == NULL || !mqttClient.connected()) {
-        return -1;
-    }
+    if (entry == NULL || !mqttClient.connected()) return -1;
 
-    StaticJsonDocument<256> doc;
+    JsonDocument doc; // Updated for ArduinoJson v7
     doc["uid"] = entry->uid;
     doc["name"] = entry->name;
     doc["timestamp"] = entry->timestamp_reg;
@@ -115,11 +100,9 @@ int publishUIDRegistration(UIDEntry *entry) {
 }
 
 int publishDatabaseSyncRequest() {
-    if (!mqttClient.connected()) {
-        return -1;
-    }
+    if (!mqttClient.connected()) return -1;
 
-    StaticJsonDocument<128> doc;
+    JsonDocument doc; // Updated for ArduinoJson v7
     doc["request"] = "sync_database";
     doc["timestamp"] = millis();
 
@@ -129,26 +112,20 @@ int publishDatabaseSyncRequest() {
     return mqttClient.publish(TOPIC_DATABASE_PULL, payload) ? 0 : -1;
 }
 
-// ============ MQTT SUBSCRIBE/CALLBACK ============
-
 void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
-    // Handle incoming MQTT messages
     if (strcmp(topic, TOPIC_DATABASE_PULL) == 0) {
-        // Database update from server
         char json_payload[512];
         if (length < 512) {
             strncpy(json_payload, (char*)payload, length);
             json_payload[length] = '\0';
             
-            // Parse and merge database
-            UIDDatabase remoteDB;
-            if (parseDatabaseFromJSON(json_payload, &remoteDB) == 0) {
+            UIDDatabase *remoteDB = new UIDDatabase(); 
+            if (remoteDB && parseDatabaseFromJSON(json_payload, remoteDB) == 0) {
                 xSemaphoreTake(databaseMutex, pdMS_TO_TICKS(500));
-                mergeDatabaseUpdates(&uidDatabase, &remoteDB);
+                mergeDatabaseUpdates(&uidDatabase, remoteDB);
                 saveUIDsToFile(&uidDatabase, SPIFFS_UID_FILE);
                 xSemaphoreGive(databaseMutex);
                 
-                // Log sync event
                 EventLog syncEvent;
                 syncEvent.type = EVENT_DATABASE_SYNCED;
                 syncEvent.timestamp = millis();
@@ -156,36 +133,27 @@ void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
                 strcpy(syncEvent.message, "Database synced from server");
                 xQueueSend(eventLogQueue, &syncEvent, pdMS_TO_TICKS(10));
             }
+            delete remoteDB;
         }
     }
 }
 
 int subscribeMQTTTopics() {
-    if (!mqttClient.connected()) {
-        return -1;
-    }
-
+    if (!mqttClient.connected()) return -1;
     mqttClient.subscribe(TOPIC_DATABASE_PULL);
-    
     return 0;
 }
 
-// ============ DATABASE SYNC ============
-
 int parseDatabaseFromJSON(const char *json_payload, UIDDatabase *db) {
-    if (json_payload == NULL || db == NULL) {
-        return -1;
-    }
+    if (json_payload == NULL || db == NULL) return -1;
 
-    StaticJsonDocument<4096> doc;
+    JsonDocument doc; // Updated for ArduinoJson v7
     DeserializationError error = deserializeJson(doc, json_payload);
 
-    if (error) {
-        return -1;
-    }
+    if (error) return -1;
 
     db->count = 0;
-    if (doc.containsKey("entries")) {
+    if (doc["entries"].is<JsonArray>()) {
         JsonArray entries = doc["entries"];
         for (JsonObject entry : entries) {
             if (db->count >= MAX_UID_ENTRIES) break;
@@ -197,25 +165,19 @@ int parseDatabaseFromJSON(const char *json_payload, UIDDatabase *db) {
         }
     }
 
-    if (doc.containsKey("last_sync")) {
-        db->last_sync = doc["last_sync"];
-    } else {
-        db->last_sync = millis();
-    }
+    db->last_sync = doc["last_sync"] | millis();
 
     return 0;
 }
 
 int databaseToJSON(UIDDatabase *db, char *json_buffer, int buffer_size) {
-    if (db == NULL || json_buffer == NULL) {
-        return -1;
-    }
+    if (db == NULL || json_buffer == NULL) return -1;
 
-    StaticJsonDocument<4096> doc;
-    JsonArray entries = doc.createNestedArray("entries");
+    JsonDocument doc; // Updated for ArduinoJson v7
+    JsonArray entries = doc["entries"].to<JsonArray>();
 
     for (int i = 0; i < db->count; i++) {
-        JsonObject entry = entries.createNestedObject();
+        JsonObject entry = entries.add<JsonObject>();
         entry["uid"] = db->entries[i].uid;
         entry["name"] = db->entries[i].name;
         entry["timestamp_reg"] = db->entries[i].timestamp_reg;
@@ -229,25 +191,15 @@ int databaseToJSON(UIDDatabase *db, char *json_buffer, int buffer_size) {
 }
 
 int mergeDatabaseUpdates(UIDDatabase *local_db, UIDDatabase *remote_db) {
-    if (local_db == NULL || remote_db == NULL) {
-        return -1;
-    }
-
-    // Simple merge: if remote is newer, use remote
+    if (local_db == NULL || remote_db == NULL) return -1;
     if (remote_db->last_sync > local_db->last_sync) {
         memcpy(local_db, remote_db, sizeof(UIDDatabase));
     }
-
     return 0;
 }
 
-// ============ WIFI UTILITIES ============
-
 int initWiFi(const char *ssid, const char *password) {
-    if (ssid == NULL || password == NULL) {
-        return -1;
-    }
-
+    if (ssid == NULL || password == NULL) return -1;
     WiFi.begin(ssid, password);
     
     int attempts = 0;
@@ -255,7 +207,6 @@ int initWiFi(const char *ssid, const char *password) {
         delay(500);
         attempts++;
     }
-
     return (WiFi.status() == WL_CONNECTED) ? 0 : -1;
 }
 
@@ -264,9 +215,7 @@ int isWiFiConnected() {
 }
 
 int getWiFiSignalStrength() {
-    if (WiFi.status() != WL_CONNECTED) {
-        return -100;  // Very weak
-    }
+    if (WiFi.status() != WL_CONNECTED) return -100;
     return WiFi.RSSI();
 }
 

@@ -1,6 +1,15 @@
 #ifndef TASKS_H
 #define TASKS_H
 
+#include <Arduino.h>
+
+extern "C" {
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+}
+
 #include "data_structures.h"
 
 // ============ EXTERNAL OBJECTS (defined in main.cpp) ============
@@ -12,8 +21,8 @@ extern QueueHandle_t httpRequestQueue;
 extern SemaphoreHandle_t rfidReadSemaphore;
 extern SemaphoreHandle_t wifiConnectedSemaphore;
 
-extern MutexHandle_t databaseMutex;
-extern MutexHandle_t serialMutex;
+extern SemaphoreHandle_t databaseMutex;
+extern SemaphoreHandle_t serialMutex;
 
 extern UIDDatabase uidDatabase;
 extern SecurityState securityState;

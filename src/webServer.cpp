@@ -1,48 +1,51 @@
 #include "webServer.h"
 #include "config.h"
+#include "tasks.h"
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-// Global web server instance
 AsyncWebServer server(WEB_SERVER_PORT);
 
-// ============ WEB SERVER INITIALIZATION ============
-
 int initWebServer() {
-    // Setup routes
-    
-    // GET /admin - Dashboard
     server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *request) {
-        char html_buffer[8192];
-        if (generateDashboardHTML(html_buffer, sizeof(html_buffer), &uidDatabase) == 0) {
-            request->send(200, "text/html", html_buffer);
-        } else {
-            request->send(500, "text/plain", "Error generating dashboard");
-        }
-    });
-
-    // GET /api/database - Get database as JSON
-    server.on("/api/database", HTTP_GET, [](AsyncWebServerRequest *request) {
-        char json_buffer[4096];
-        if (xSemaphoreTake(databaseMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            if (generateDatabaseJSON(json_buffer, sizeof(json_buffer), &uidDatabase) == 0) {
-                request->send(200, "application/json", json_buffer);
+        char *html_buffer = (char *)malloc(8192);
+        if (html_buffer) {
+            if (generateDashboardHTML(html_buffer, 8192, &uidDatabase) == 0) {
+                request->send(200, "text/html", html_buffer);
             } else {
-                request->send(500, "application/json", "{\"error\":\"Buffer overflow\"}");
+                request->send(500, "text/plain", "Error generating dashboard");
             }
-            xSemaphoreGive(databaseMutex);
+            free(html_buffer); 
         } else {
-            request->send(503, "application/json", "{\"error\":\"Database busy\"}");
+            request->send(500, "text/plain", "Memory allocation failed");
         }
     });
 
-    // POST /api/register - Register new UID
+    server.on("/api/database", HTTP_GET, [](AsyncWebServerRequest *request) {
+        char *json_buffer = (char *)malloc(4096);
+        if (json_buffer) {
+            if (xSemaphoreTake(databaseMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                if (generateDatabaseJSON(json_buffer, 4096, &uidDatabase) == 0) {
+                    request->send(200, "application/json", json_buffer);
+                } else {
+                    request->send(500, "application/json", "{\"error\":\"Buffer overflow\"}");
+                }
+                xSemaphoreGive(databaseMutex);
+            } else {
+                request->send(503, "application/json", "{\"error\":\"Database busy\"}");
+            }
+            free(json_buffer);
+        } else {
+            request->send(500, "application/json", "{\"error\":\"Memory allocation failed\"}");
+        }
+    });
+
     server.on("/api/register", HTTP_POST, [](AsyncWebServerRequest *request) {},
               nullptr,
               [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (len > 0) {
-            StaticJsonDocument<256> doc;
+            JsonDocument doc; 
             char json_str[256];
             memcpy(json_str, data, len);
             json_str[len] = '\0';
@@ -53,13 +56,11 @@ int initWebServer() {
                 const char* name = doc["name"];
 
                 if (uid && name && validateUIDFormat(uid) && validateNameFormat(name)) {
-                    // Check for duplicates
                     if (checkDuplicateUID(uid, &uidDatabase)) {
                         request->send(409, "application/json", "{\"error\":\"UID already exists\"}");
                         return;
                     }
 
-                    // Queue for processing
                     HTTPRequest httpReq;
                     httpReq.type = HTTP_POST_REGISTER;
                     strncpy(httpReq.uid, uid, 8);
@@ -83,9 +84,8 @@ int initWebServer() {
         }
     });
 
-    // DELETE /api/uid/{uid} - Delete UID
-    server.on("/api/uid/(.+)", HTTP_DELETE, [](AsyncWebServerRequest *request, const String& uid_str) {
-        String uid = uid_str;
+    server.on("^\\/api\\/uid\\/([a-fA-F0-9]{8})$", HTTP_DELETE, [](AsyncWebServerRequest *request) {
+        String uid = request->pathArg(0);
         
         if (validateUIDFormat(uid.c_str())) {
             HTTPRequest httpReq;
@@ -105,7 +105,6 @@ int initWebServer() {
         }
     });
 
-    // 404 handler
     server.onNotFound(handleNotFound);
 
     return 0;
@@ -122,24 +121,18 @@ int stopWebServer() {
 }
 
 int isWebServerRunning() {
-    // AsyncWebServer doesn't have direct way to check, so we assume it's running
     return 1;
 }
 
-// ============ HTTP ROUTE HANDLERS ============
-
-void handleNotFound() {
-    // Handled by onNotFound callback
+void handleNotFound(AsyncWebServerRequest *request) {
+    request->send(404, "text/plain", "Not found");
 }
 
-// ============ HTML ASSET GENERATION ============
-
 int generateDashboardHTML(char *buffer, int buffer_size, UIDDatabase *db) {
-    if (buffer == NULL || buffer_size < 2000) {
-        return -1;
-    }
+    if (buffer == NULL || buffer_size < 2000) return -1;
 
-    const char html_template[] = R"(
+    // Strict delimiter R"=====(...)=====" prevents JS quote issues in C++
+    const char html_template[] = R"=====(
 <!DOCTYPE html>
 <html>
 <head>
@@ -268,14 +261,12 @@ int generateDashboardHTML(char *buffer, int buffer_size, UIDDatabase *db) {
             });
         }
 
-        // Load on page start
         window.onload = loadDatabase;
-        // Refresh every 5 seconds
         setInterval(loadDatabase, 5000);
     </script>
 </body>
 </html>
-    )";
+    )=====";
 
     strncpy(buffer, html_template, buffer_size - 1);
     buffer[buffer_size - 1] = '\0';
@@ -283,15 +274,13 @@ int generateDashboardHTML(char *buffer, int buffer_size, UIDDatabase *db) {
 }
 
 int generateDatabaseJSON(char *buffer, int buffer_size, UIDDatabase *db) {
-    if (buffer == NULL || db == NULL || buffer_size < 512) {
-        return -1;
-    }
+    if (buffer == NULL || db == NULL || buffer_size < 512) return -1;
 
-    StaticJsonDocument<4096> doc;
-    JsonArray entries = doc.createNestedArray("entries");
+    JsonDocument doc; // Updated for ArduinoJson v7
+    JsonArray entries = doc["entries"].to<JsonArray>();
 
     for (int i = 0; i < db->count; i++) {
-        JsonObject entry = entries.createNestedObject();
+        JsonObject entry = entries.add<JsonObject>();
         entry["uid"] = db->entries[i].uid;
         entry["name"] = db->entries[i].name;
         entry["timestamp_reg"] = db->entries[i].timestamp_reg;
@@ -303,8 +292,6 @@ int generateDatabaseJSON(char *buffer, int buffer_size, UIDDatabase *db) {
     serializeJson(doc, buffer, buffer_size);
     return 0;
 }
-
-// ============ REQUEST VALIDATION ============
 
 int validateUIDFormat(const char *uid_str) {
     if (uid_str == NULL) return 0;
@@ -327,8 +314,8 @@ int checkDuplicateUID(const char *uid_str, UIDDatabase *db) {
 
     for (int i = 0; i < db->count; i++) {
         if (strcmp(db->entries[i].uid, uid_str) == 0) {
-            return 1;  // Duplicate found
+            return 1; 
         }
     }
-    return 0;  // Unique
+    return 0;
 }

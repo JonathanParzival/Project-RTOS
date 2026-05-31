@@ -1,19 +1,8 @@
 #include "tasks.h"
 #include "config.h"
+#include "security.h"
 #include <Arduino.h>
 
-/**
- * @brief Security Task - Monitor failed attempts and lockout
- * Priority: MEDIUM (2)
- * Period: 1000ms
- * 
- * Workflow:
- * 1. Monitor securityState for failed attempts
- * 2. Check if lockout is active
- * 3. If lockout has expired, unlock system
- * 4. Log security events
- * 5. Optional: Send alerts if needed
- */
 void vSecurityTask(void *pvParameters) {
     BaseType_t xStatus;
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -28,7 +17,6 @@ void vSecurityTask(void *pvParameters) {
         uint32_t current_time = millis();
         int current_attempts = securityState.failed_attempts;
 
-        // Check if new failed attempt occurred
         if (current_attempts != last_attempt_count) {
             last_attempt_count = current_attempts;
             
@@ -37,7 +25,6 @@ void vSecurityTask(void *pvParameters) {
                           current_attempts, MAX_FAILED_ATTEMPTS);
             xSemaphoreGive(serialMutex);
 
-            // If we're approaching max attempts, prepare warning
             if (current_attempts >= MAX_FAILED_ATTEMPTS - 1) {
                 EventLog warningEvent;
                 warningEvent.type = EVENT_ERROR;
@@ -49,11 +36,8 @@ void vSecurityTask(void *pvParameters) {
             }
         }
 
-        // Check if system is locked
         if (securityState.is_locked) {
-            // Check if lockout duration has expired
             if (current_time >= securityState.lockout_until) {
-                // Lockout expired - unlock system
                 clearFailedAttempts(&securityState);
 
                 xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
@@ -67,7 +51,6 @@ void vSecurityTask(void *pvParameters) {
                 strcpy(unlockEvent.message, "System unlocked");
                 xQueueSend(eventLogQueue, &unlockEvent, pdMS_TO_TICKS(10));
             } else {
-                // Still locked - log remaining time every 5 seconds
                 uint32_t remaining_ms = securityState.lockout_until - current_time;
                 if (current_time - last_log_time > 5000) {
                     last_log_time = current_time;
@@ -79,7 +62,6 @@ void vSecurityTask(void *pvParameters) {
                 }
             }
         } else {
-            // System is unlocked
             if (current_time - last_log_time > 10000) {
                 last_log_time = current_time;
                 
@@ -90,7 +72,6 @@ void vSecurityTask(void *pvParameters) {
             }
         }
 
-        // Periodic delay 1000ms
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(SECURITY_TASK_PERIOD));
     }
 }
