@@ -5,9 +5,11 @@
 
 require_once __DIR__ . '/../db.php';
 
+// Dipanggil setelah verify.php mengizinkan akses dan firmware menghitung token.
 requireMethod('POST');
 $body = getRequestBody();
 
+// user_id berasal dari database, new_uid adalah rolling token 8 hex.
 $user_id = (int)($body['user_id'] ?? 0);
 $new_uid = strtoupper(trim($body['new_uid'] ?? ''));
 
@@ -24,6 +26,7 @@ try {
 
     // Make sure another user doesn't already own the new UID
     // (extremely unlikely with a proper rolling algorithm, but guard anyway)
+    // Guard ini penting karena UID adalah kredensial; collision harus ditolak.
     $check = $db->prepare(
         'SELECT id FROM users WHERE uid = :uid AND id != :id LIMIT 1'
     );
@@ -32,6 +35,7 @@ try {
         jsonResponse(['error' => 'UID collision — new_uid already assigned to another user'], 409);
     }
 
+    // Hanya user aktif yang boleh menerima token baru.
     $stmt = $db->prepare(
         'UPDATE users SET uid = :uid WHERE id = :id AND is_active = 1'
     );
@@ -41,6 +45,7 @@ try {
         jsonResponse(['error' => 'User not found or inactive'], 404);
     }
 
+    // Response ringkas karena firmware hanya memerlukan status sukses/gagal.
     jsonResponse(['success' => true]);
 
 } catch (PDOException $e) {

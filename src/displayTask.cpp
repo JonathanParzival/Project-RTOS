@@ -3,18 +3,30 @@
 #include <Arduino.h>
 #include <LiquidCrystal_I2C.h>
 
-// Initialize LCD
+// Object LCD global karena driver I2C menyimpan state perangkat dan dipakai
+// sepanjang hidup DisplayTask.
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
+/**
+ * @brief Task tampilan: konsumen eventLogQueue dan pengendali LCD 16x2.
+ *
+ * Task ini dijalankan low priority karena LCD/Serial adalah I/O lambat dan tidak
+ * boleh mengalahkan jalur pembacaan/autentikasi kartu. Semua event diproses dari
+ * queue agar task lain tidak menulis LCD secara langsung.
+ */
 void vDisplayTask(void *pvParameters) {
     EventLog eventLog;
     BaseType_t xStatus;
+
+    // Basis periodik untuk refresh idle screen dan polling queue.
     TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    // Buffer 17 byte: 16 karakter LCD + null terminator.
     char lcd_line1[17] = {0};
     char lcd_line2[17] = {0};
     static uint32_t last_event_time = 0;
 
-    // Initialize LCD
+    // Inisialisasi LCD dilakukan di task ini agar ownership I2C/LCD jelas.
     lcd.init();
     lcd.backlight();
     lcd.print("Initializing...");
@@ -26,10 +38,13 @@ void vDisplayTask(void *pvParameters) {
     xSemaphoreGive(serialMutex);
 
     while (1) {
-        // Wait for event log from queue (250ms timeout)
+        // Tunggu event dari Auth/Security task. Timeout memungkinkan task tetap
+        // memperbarui idle screen walaupun queue kosong.
         xStatus = xQueueReceive(eventLogQueue, &eventLog, pdMS_TO_TICKS(250));
 
         if (xStatus == pdPASS) {
+            // Debounce event tampilan: mencegah LCD berkedip terlalu cepat jika
+            // beberapa event masuk hampir bersamaan.
             TickType_t start = xTaskGetTickCount();
             // Debounce: skip if event is too recent
             uint32_t current_time = millis();
@@ -38,10 +53,13 @@ void vDisplayTask(void *pvParameters) {
             }
             last_event_time = current_time;
 
-            // Format display based on event type
+            // Bersihkan buffer sebelum snprintf supaya sisa string sebelumnya
+            // tidak tertinggal di layar bila pesan baru lebih pendek.
             memset(lcd_line1, 0, sizeof(lcd_line1));
             memset(lcd_line2, 0, sizeof(lcd_line2));
 
+            // Mapping EventType ke dua baris LCD. snprintf membatasi output ke
+            // 16 karakter plus terminator sesuai ukuran LCD.
             switch (eventLog.type) {
                 case EVENT_ACCESS_GRANTED:
                     snprintf(lcd_line1, 17, "ACCESS GRANTED");
@@ -73,11 +91,14 @@ void vDisplayTask(void *pvParameters) {
 
                 default:
                     snprintf(lcd_line1, 17, "STATUS: %d", eventLog.type);
-                    // FIXED: format string protection added
+                    // Format string protection: pesan diperlakukan sebagai data,
+                    // bukan sebagai format printf.
                     snprintf(lcd_line2, 17, "%s", eventLog.message); 
                     break;
             }
 
+            // Update LCD dan Serial di satu critical section agar output event
+            // tampil konsisten. Timeout pendek mencegah deadlock panjang.
             // Update LCD with mutex protection
             TickType_t end = xTaskGetTickCount();
             xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
@@ -94,7 +115,8 @@ void vDisplayTask(void *pvParameters) {
             
             xSemaphoreGive(serialMutex);
         } else {
-            // No event - show idle screen
+            // Queue kosong: tampilkan idle screen kira-kira tiap 1 detik
+            // (4 siklus x DISPLAY_TASK_PERIOD 250 ms).
             static uint32_t idle_counter = 0;
             if (++idle_counter > 4) {  // Every 1 second
                 idle_counter = 0;
@@ -111,7 +133,7 @@ void vDisplayTask(void *pvParameters) {
             }
         }
 
-        // Periodic delay 250ms
+        // Delay periodik menjaga refresh display tidak memonopoli CPU.
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(DISPLAY_TASK_PERIOD));
     }
 }

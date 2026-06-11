@@ -11,9 +11,11 @@
 
 require_once __DIR__ . '/../db.php';
 
+// Endpoint logging dipanggil best-effort oleh firmware setelah event lokal dibuat.
 requireMethod('POST');
 $body = getRequestBody();
 
+// Normalisasi dan pembatasan panjang menjaga data log sesuai ukuran kolom umum.
 $event_type = (int)($body['type']      ?? 7);
 $uid        = strtoupper(trim($body['uid']       ?? ''));
 $user_name  = substr(trim($body['user_name'] ?? ''), 0, 50);
@@ -28,6 +30,7 @@ if ($uid !== '' && !preg_match('/^[0-9A-F]{8}$/', $uid)) {
 try {
     $db = getDB();
 
+    // Prepared INSERT menerima event akses, error server, dan event sistem.
     $stmt = $db->prepare(
         'INSERT INTO event_log (event_type, uid, user_name, result, message)
          VALUES (:type, :uid, :user_name, :result, :message)'
@@ -40,6 +43,8 @@ try {
         ':message'   => ($message !== '') ? $message : null,
     ]);
 
+    // log_id dikembalikan untuk debugging/manual test; firmware saat ini tidak
+    // memakainya.
     jsonResponse(['success' => true, 'log_id' => (int)$db->lastInsertId()]);
 
 } catch (PDOException $e) {

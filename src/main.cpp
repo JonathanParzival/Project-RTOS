@@ -12,47 +12,95 @@
 #include "security.h"
 #include "comm.h"
 
-// ============ GLOBAL OBJECTS ============
+// ============ GLOBAL FREERTOS OBJECTS ============
+// Semua handle di bawah dibuat sekali saat boot dan dipakai bersama oleh task.
+// Handle disimpan global karena FreeRTOS object bersifat kernel-level object:
+// task yang berbeda hanya perlu memegang handle, bukan salinan object-nya.
 
-// Queues
+// Queue data RFID: jalur producer-consumer dari InputTask ke AuthTask.
+// Queue membuat pembacaan kartu tidak hilang walaupun AuthTask sedang HTTP.
 QueueHandle_t rfidDataQueue  = NULL;
+
+// Queue event sistem: jalur dari Auth/Security task menuju DisplayTask.
+// DisplayTask menjadi satu-satunya konsumen LCD sehingga output lebih rapi.
 QueueHandle_t eventLogQueue  = NULL;
 
-// Semaphores
+// Binary semaphore untuk mengubah edge interrupt RFID menjadi kerja task.
+// ISR memberi semaphore, InputTask mengambilnya di context task yang aman.
 SemaphoreHandle_t rfidReadSemaphore     = NULL;
+
+// Binary semaphore penanda WiFi pernah berhasil tersambung saat boot.
+// Saat ini dipakai sebagai state signal yang tersedia untuk ekstensi task lain.
 SemaphoreHandle_t wifiConnectedSemaphore = NULL;
 
-// Mutexes
+// Mutex untuk melindungi Serial dari output task yang saling bertumpuk.
+// Beberapa akses LCD juga digabung dengan mutex ini karena keduanya I/O lambat.
 SemaphoreHandle_t serialMutex = NULL;
 
-// Shared state
+// State keamanan dibagi antara AuthTask dan SecurityTask.
+// Catatan: aksesnya sederhana dan singkat; bila diperluas, pertimbangkan mutex.
 SecurityState securityState;
 
 // ============ ISR ============
 
+/**
+ * @brief ISR RFID yang sangat pendek dan aman untuk interrupt context.
+ *
+ * ISR tidak membaca RFID, tidak melakukan Serial print, dan tidak memanggil
+ * API blocking. Ia hanya memberi semaphore ke InputTask. Pola ini menjaga
+ * latency interrupt tetap kecil dan memindahkan pekerjaan berat ke scheduler.
+ */
 void IRAM_ATTR rfidISR() {
+    // Flag ini diisi oleh FreeRTOS bila task yang dibangunkan memiliki prioritas
+    // lebih tinggi dari task yang sedang berjalan sebelum interrupt terjadi.
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    // Versi FromISR wajib dipakai di ISR; versi normal xSemaphoreGive() tidak
+    // aman karena dapat menyentuh mekanisme blocking milik task context.
     xSemaphoreGiveFromISR(rfidReadSemaphore, &xHigherPriorityTaskWoken);
+
+    // Jika InputTask perlu segera berjalan, minta context switch saat ISR selesai.
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 // ============ INITIALIZATION ============
 
+/**
+ * @brief Membuat queue, semaphore, dan mutex yang menjadi fondasi sinkronisasi.
+ *
+ * Fungsi ini harus dipanggil sebelum attachInterrupt() dan sebelum task dibuat,
+ * supaya ISR/task tidak pernah memakai handle NULL. Ukuran queue diambil dari
+ * config.h agar kapasitas buffering dapat diatur tanpa menyentuh logika task.
+ */
 void initializeSynchronization() {
+    // Queue menyimpan salinan struct, bukan pointer, sehingga payload tetap valid
+    // walaupun variabel lokal producer sudah keluar scope.
     rfidDataQueue  = xQueueCreate(RFID_DATA_QUEUE_SIZE, sizeof(RFIDData));
     eventLogQueue  = xQueueCreate(EVENT_LOG_QUEUE_SIZE,  sizeof(EventLog));
 
+    // Binary semaphore default-nya kosong; InputTask akan menunggu sampai ISR
+    // memberi token saat RFID_INT_PIN mendeteksi edge.
     rfidReadSemaphore     = xSemaphoreCreateBinary();
     wifiConnectedSemaphore = xSemaphoreCreateBinary();
+
+    // Mutex menyediakan priority inheritance; lebih cocok dari binary semaphore
+    // untuk resource bersama seperti Serial.
     serialMutex           = xSemaphoreCreateMutex();
 
     if (!rfidDataQueue || !eventLogQueue ||
         !rfidReadSemaphore || !serialMutex) {
         Serial.println("[ERROR] Failed to create FreeRTOS objects!");
+        // Stop boot dengan delay RTOS agar watchdog/scheduler masih punya waktu.
         while (1) vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
+/**
+ * @brief Inisialisasi I/O fisik ESP32: Serial, GPIO output, input interrupt, I2C.
+ *
+ * Semua pin output dipaksa LOW sebelum task dibuat agar relay/LED/buzzer tidak
+ * berada di kondisi acak saat scheduler mulai menjalankan task.
+ */
 void setupHardware() {
     Serial.begin(115200);
     delay(500);
@@ -75,6 +123,12 @@ void setupHardware() {
     Serial.println("[BOOT] Hardware initialized");
 }
 
+/**
+ * @brief Koneksi WiFi awal sebelum task komunikasi mengambil alih monitoring.
+ *
+ * Koneksi boot dibuat blocking dengan batas 20 percobaan. Setelah scheduler
+ * berjalan, CommTask bertugas melakukan reconnect dan heartbeat secara periodik.
+ */
 void setupWiFi() {
     Serial.printf("[BOOT] Connecting to WiFi: %s\n", WIFI_SSID);
 
@@ -88,6 +142,7 @@ void setupWiFi() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
+        // Sinyal ini dapat dipakai task lain sebagai gate awal konektivitas.
         xSemaphoreGive(wifiConnectedSemaphore);
         Serial.printf("[BOOT] WiFi connected — IP: %s\n", WiFi.localIP().toString().c_str());
         Serial.printf("[BOOT] XAMPP server: %s\n", XAMPP_BASE_URL);
@@ -96,6 +151,13 @@ void setupWiFi() {
     }
 }
 
+/**
+ * @brief Membuat seluruh task aplikasi dengan stack dan prioritas dari config.h.
+ *
+ * Prioritas tinggi diberikan ke InputTask/AuthTask karena keduanya berada di
+ * jalur akses kartu. Comm/Security berjalan medium, Display low karena output
+ * LCD tidak boleh menghambat autentikasi.
+ */
 void createAllTasks() {
     xTaskCreate(vInputTask,    "InputTask",    INPUT_TASK_STACK,    NULL, INPUT_PRIORITY,    NULL);
     xTaskCreate(vAuthTask,     "AuthTask",     AUTH_TASK_STACK,     NULL, AUTH_PRIORITY,     NULL);
@@ -109,14 +171,18 @@ void createAllTasks() {
 // ============ MAIN ============
 
 void setup() {
+    // Urutan boot penting: hardware dulu, lalu object sinkronisasi, baru ISR/task.
     setupHardware();
     initializeSynchronization();
 
-    // Zero out security state
+    // Zero out security state agar lockout/attempt counter mulai dari kondisi
+    // deterministik walaupun RAM menyimpan nilai sisa reset sebelumnya.
     memset(&securityState, 0, sizeof(SecurityState));
 
     setupWiFi();
 
+    // Interrupt dipasang setelah semaphore dibuat. Mode FALLING mengasumsikan
+    // modul RFID menarik pin INT ke LOW saat kartu terdeteksi.
     attachInterrupt(digitalPinToInterrupt(RFID_INT_PIN), rfidISR, FALLING);
     Serial.printf("[BOOT] ISR attached to GPIO %d\n", RFID_INT_PIN);
 
@@ -124,6 +190,8 @@ void setup() {
 }
 
 void loop() {
+    // Arduino loop tetap berjalan sebagai task bawaan. Delay RTOS dipakai agar
+    // task lain tetap mendapatkan CPU, bukan busy-wait dengan delay blocking lama.
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     static int counter = 0;
@@ -135,6 +203,12 @@ void loop() {
 
 // ============ UTILITY ============
 
+/**
+ * @brief Snapshot status sistem untuk debugging periodik.
+ *
+ * Output Serial dilindungi mutex supaya baris statistik tidak bercampur dengan
+ * log dari task lain. Timeout pendek mencegah task ini menunggu terlalu lama.
+ */
 void printTaskStats() {
     xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
     Serial.println("\n=== SYSTEM STATISTICS ===");

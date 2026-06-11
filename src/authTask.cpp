@@ -4,10 +4,29 @@
 #include "comm.h"
 #include <Arduino.h>
 
+/**
+ * @brief Task autentikasi utama untuk UID RFID.
+ *
+ * Task ini adalah konsumen rfidDataQueue dan producer eventLogQueue. Ia juga
+ * melakukan I/O jaringan ke XAMPP, menghitung rolling token, mengubah state
+ * lockout, dan memberi feedback hardware.
+ *
+ * Catatan scheduling:
+ * - Queue receive memakai timeout 100 ms supaya task tetap punya titik periodik.
+ * - AUTH_TASK_STACK lebih besar karena HTTPClient dan ArduinoJson memakai stack
+ *   lebih banyak dibanding task GPIO biasa.
+ */
 void vAuthTask(void *pvParameters) {
+    // Payload RFID dari queue input. QueueReceive menyalin isi struct ke sini.
     RFIDData         rfidData;
+
+    // Event yang dikirim ke DisplayTask dan juga dapat dikirim ke server.
     EventLog         eventLog;
+
+    // Response server disediakan caller agar httpClient tidak memakai global state.
     ServerAuthResponse authResp;
+
+    // Basis delay periodik untuk mengurangi jitter eksekusi task.
     TickType_t       xLastWakeTime = xTaskGetTickCount();
 
     xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
@@ -15,13 +34,19 @@ void vAuthTask(void *pvParameters) {
     xSemaphoreGive(serialMutex);
 
     while (1) {
-        // Block until a UID arrives (100 ms timeout so vTaskDelayUntil still fires)
+        // Blok sampai ada UID, tetapi tetap timeout agar lock/scheduling periodik
+        // tidak bergantung pada ada/tidaknya kartu.
         if (xQueueReceive(rfidDataQueue, &rfidData, pdMS_TO_TICKS(100)) == pdPASS) {
+
+            // Lockout dicek paling awal supaya kartu apa pun ditolak tanpa HTTP.
+            // Ini mengurangi traffic server saat ada percobaan spoofing beruntun.
             TickType_t start = xTaskGetTickCount();
             // Reject scans while system is locked out
             if (isSystemLocked(&securityState)) {
                 feedbackLockout();
 
+                // Event lockout dikirim ke DisplayTask. Payload UID tetap dicatat
+                // agar operator tahu kartu mana yang mencoba saat sistem terkunci.
                 eventLog.type      = EVENT_SYSTEM_LOCKOUT;
                 eventLog.timestamp = rfidData.timestamp;
                 eventLog.result    = 0;
@@ -38,7 +63,8 @@ void vAuthTask(void *pvParameters) {
                 continue;
             }
 
-            // Convert scanned UID to hex string for HTTP calls
+            // Server XAMPP menerima UID sebagai string 8 hex, sedangkan reader
+            // dan queue firmware menyimpan UID sebagai 4 byte.
             char uid_hex[9];
             uidBinaryToHex(rfidData.uid, uid_hex);
 
@@ -46,11 +72,13 @@ void vAuthTask(void *pvParameters) {
             Serial.printf("[Auth] Verifying UID %s with server...\n", uid_hex);
             xSemaphoreGive(serialMutex);
 
-            // ── Step 1: Verify with XAMPP ──────────────────────────────────
+            // Step 1: verifikasi UID dengan database XAMPP lewat HTTP POST.
+            // Return 0 berarti HTTP/JSON sukses; authorized menentukan akses.
             int net_ok = verifyUIDWithServer(uid_hex, &authResp);
 
             if (net_ok != 0) {
-                // Network / server unreachable
+                // Network/server unreachable: bedakan dari kartu tidak terdaftar.
+                // Failed attempt tidak dinaikkan karena ini bukan bukti spoofing.
                 feedbackFailure();
 
                 eventLog.type      = EVENT_SERVER_ERROR;
@@ -71,10 +99,12 @@ void vAuthTask(void *pvParameters) {
             }
 
             if (authResp.authorized) {
-                // ── Step 2: Compute next rolling token ────────────────────
+                // Step 2: hitung UID berikutnya untuk rolling token.
+                // Rolling token mengurangi risiko replay UID lama.
                 uint8_t new_uid[4];
                 if (calculateRollingToken(rfidData.uid, new_uid) != 0) {
-                    // Should never happen, but handle gracefully
+                    // Harusnya tidak terjadi karena buffer valid, tetapi tetap
+                    // ditangani agar task tidak crash jika kontrak fungsi berubah.
                     feedbackFailure();
                     xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
                     Serial.println("[Auth] ERROR: Rolling token calculation failed");
@@ -86,18 +116,20 @@ void vAuthTask(void *pvParameters) {
                 char new_uid_hex[9];
                 uidBinaryToHex(new_uid, new_uid_hex);
 
-                // ── Step 3: Push new UID to server ────────────────────────
+                // Step 3: simpan UID baru ke server sebelum scan berikutnya.
+                // Bila gagal, akses tetap diberi karena user sudah terverifikasi.
                 if (updateUIDOnServer(authResp.user_id, new_uid_hex) != 0) {
-                    // Access still granted; rolling update failed — log warning only
                     xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
                     Serial.println("[Auth] WARNING: Rolling token update failed on server");
                     xSemaphoreGive(serialMutex);
                 }
 
-                // ── Step 4: Hardware feedback + display event ─────────────
+                // Step 4: feedback lokal dan reset counter gagal.
                 feedbackSuccess();
                 clearFailedAttempts(&securityState);
 
+                // EventLog di-clear agar field yang tidak diisi eksplisit tidak
+                // membawa sisa data dari event sebelumnya.
                 memset(&eventLog, 0, sizeof(EventLog));
                 eventLog.type      = EVENT_ACCESS_GRANTED;
                 eventLog.timestamp = rfidData.timestamp;
@@ -108,7 +140,8 @@ void vAuthTask(void *pvParameters) {
                          "Access granted — token updated to %s", new_uid_hex);
                 xQueueSend(eventLogQueue, &eventLog, pdMS_TO_TICKS(10));
 
-                // ── Step 5: Log event to server (best-effort) ─────────────
+                // Step 5: logging server best-effort. Kegagalan log tidak boleh
+                // membatalkan akses atau memblokir task terlalu lama.
                 logEventToServer(&eventLog);
 
                 xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100));
@@ -117,7 +150,8 @@ void vAuthTask(void *pvParameters) {
                 xSemaphoreGive(serialMutex);
 
             } else {
-                // ── Access denied ─────────────────────────────────────────
+                // Access denied: kartu tidak dikenal dianggap percobaan gagal dan
+                // dapat memicu lockout setelah mencapai MAX_FAILED_ATTEMPTS.
                 feedbackFailure();
                 int attempt_count = recordFailedAttempt(&securityState);
 
@@ -141,6 +175,9 @@ void vAuthTask(void *pvParameters) {
                 xSemaphoreGive(serialMutex);
 
                 if (isSystemLocked(&securityState)) {
+                    // Lockout baru terjadi setelah recordFailedAttempt() menaikkan
+                    // counter sampai ambang batas. Event ini memudahkan LCD/server
+                    // membedakan denied biasa dari kondisi terkunci.
                     feedbackLockout();
 
                     EventLog lockEvent = {};

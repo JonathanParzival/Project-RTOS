@@ -8,22 +8,31 @@
 
 /**
  * @brief Connect to WiFi using config.h credentials
+ *
+ * Fungsi blocking dengan timeout internal; panggil dari setup/CommTask, bukan ISR.
+ *
  * @return 0 if connected, -1 if timeout
  */
 int initWiFi(const char *ssid, const char *password);
 
 /**
  * @brief 1 if connected, 0 otherwise
+ *
+ * Wrapper tipis agar task tidak bergantung langsung pada WiFi.status().
  */
 int isWiFiConnected();
 
 /**
  * @brief RSSI in dBm
+ *
+ * Mengembalikan nilai fallback lemah saat WiFi putus.
  */
 int getWiFiSignalStrength();
 
 /**
  * @brief Static string with current IP address
+ *
+ * Pointer valid sampai pemanggilan berikutnya; jangan dimodifikasi caller.
  */
 const char* getESP32IPAddress();
 
@@ -63,6 +72,7 @@ int updateUIDOnServer(int user_id, const char *new_uid_hex);
  *                            "message": "..." }
  *
  * Non-blocking best-effort: a failure here is logged to Serial only.
+ * Caller tetap harus siap bila fungsi ini blocking sampai HTTP_TIMEOUT_MS.
  *
  * @param event  Pointer to populated EventLog struct
  * @return 0 on success, -1 on error

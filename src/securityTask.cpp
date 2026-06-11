@@ -3,9 +3,21 @@
 #include "security.h"
 #include <Arduino.h>
 
+/**
+ * @brief Task monitoring keamanan dan timer lockout.
+ *
+ * AuthTask menaikkan counter gagal dan dapat mengaktifkan lockout. SecurityTask
+ * memonitor perubahan counter tersebut, mengirim warning ke eventLogQueue, dan
+ * membuka lockout saat durasinya habis.
+ */
 void vSecurityTask(void *pvParameters) {
     BaseType_t xStatus;
+
+    // DelayUntil membuat pemeriksaan berjalan tiap SECURITY_TASK_PERIOD secara
+    // konsisten, bukan sekadar tidur relatif setelah pekerjaan selesai.
     TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    // Static state lokal dipertahankan antar-iterasi tanpa memakai global.
     static uint32_t last_log_time = 0;
     static int last_attempt_count = 0;
 
@@ -16,6 +28,10 @@ void vSecurityTask(void *pvParameters) {
     while (1) {
         TickType_t start = xTaskGetTickCount();
         uint32_t current_time = millis();
+
+        // Snapshot sederhana dari shared securityState. Karena field int/uint32_t
+        // dibaca singkat, risiko tearing rendah di ESP32; untuk state kompleks,
+        // gunakan mutex khusus.
         int current_attempts = securityState.failed_attempts;
 
         if (current_attempts != last_attempt_count) {
@@ -27,6 +43,8 @@ void vSecurityTask(void *pvParameters) {
             xSemaphoreGive(serialMutex);
 
             if (current_attempts >= MAX_FAILED_ATTEMPTS - 1) {
+                // Warning dikirim sebelum lockout penuh agar DisplayTask/operator
+                // bisa melihat sistem mendekati ambang gagal.
                 EventLog warningEvent;
                 warningEvent.type = EVENT_ERROR;
                 warningEvent.timestamp = current_time;
@@ -38,6 +56,8 @@ void vSecurityTask(void *pvParameters) {
         }
 
         if (securityState.is_locked) {
+            // Unlock berbasis waktu millis(). isSystemLocked() juga punya logika
+            // auto-unlock, tetapi task ini membuat transisi tersebut terlihat di log.
             if (current_time >= securityState.lockout_until) {
                 clearFailedAttempts(&securityState);
 
@@ -53,6 +73,7 @@ void vSecurityTask(void *pvParameters) {
                 xQueueSend(eventLogQueue, &unlockEvent, pdMS_TO_TICKS(10));
             } else {
                 uint32_t remaining_ms = securityState.lockout_until - current_time;
+                // Throttle log lockout tiap 5 detik agar Serial tidak penuh.
                 if (current_time - last_log_time > 5000) {
                     last_log_time = current_time;
                     
@@ -64,6 +85,8 @@ void vSecurityTask(void *pvParameters) {
                 }
             }
         } else {
+            // Health log normal tiap 10 detik. Ini membantu debugging tanpa
+            // menghasilkan output setiap siklus 1 detik.
             if (current_time - last_log_time > 10000) {
                 last_log_time = current_time;
                 
@@ -74,6 +97,7 @@ void vSecurityTask(void *pvParameters) {
             }
         }
 
+        // Perioda monitoring didefinisikan di config.h agar mudah dituning.
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(SECURITY_TASK_PERIOD));
     }
 }

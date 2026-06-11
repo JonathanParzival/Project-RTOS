@@ -13,19 +13,23 @@ extern "C" {
 #include "data_structures.h"
 
 // ============ GLOBAL SYNCHRONIZATION OBJECTS (defined in main.cpp) ============
+// Deklarasi extern membuat semua task memakai object FreeRTOS yang sama. Object
+// sebenarnya dibuat di initializeSynchronization() sebelum scheduler efektif
+// menjalankan task aplikasi.
 
 // Queues
-extern QueueHandle_t rfidDataQueue;   // inputTask  → authTask
-extern QueueHandle_t eventLogQueue;   // authTask   → displayTask
+extern QueueHandle_t rfidDataQueue;   // InputTask producer -> AuthTask consumer
+extern QueueHandle_t eventLogQueue;   // Auth/Security producer -> DisplayTask consumer
 
 // Semaphores
-extern SemaphoreHandle_t rfidReadSemaphore;     // ISR → inputTask
+extern SemaphoreHandle_t rfidReadSemaphore;     // ISR -> InputTask wake signal
 extern SemaphoreHandle_t wifiConnectedSemaphore;
 
 // Mutexes
-extern SemaphoreHandle_t serialMutex;   // Protect Serial output
+extern SemaphoreHandle_t serialMutex;   // Protect shared Serial/LCD debug output
 
 // Shared state
+// State keamanan global. Saat akses state makin kompleks, tambahkan mutex khusus.
 extern SecurityState securityState;
 
 // ============ TASK DECLARATIONS ============
@@ -65,13 +69,26 @@ void vDisplayTask(void *pvParameters);
 
 /**
  * @brief Minimal RFID interrupt — only gives rfidReadSemaphore.
+ *
+ * Tidak boleh melakukan Serial print, HTTP, SPIFFS, atau delay di ISR.
  */
 void rfidISR();
 
 // ============ SETUP HELPERS ============
 
+/**
+ * @brief Buat queue/semaphore/mutex FreeRTOS sebelum ISR dan task aktif.
+ */
 void initializeSynchronization();
+
+/**
+ * @brief Spawn semua task aplikasi dengan stack/prioritas dari config.h.
+ */
 void createAllTasks();
+
+/**
+ * @brief Cetak snapshot statistik sistem secara periodik dari loop Arduino.
+ */
 void printTaskStats();
 
 #endif // TASKS_H

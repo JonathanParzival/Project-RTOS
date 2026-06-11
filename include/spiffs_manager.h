@@ -5,11 +5,14 @@
 
 // ============ UID DATABASE STRUCTURES ============
 
+// Kapasitas database lokal sengaja statis agar pemakaian memori mudah diprediksi
+// pada ESP32/FreeRTOS.
 #define MAX_UID_ENTRIES     20
 #define UID_HEX_LEN         9    // "12345678\0"
 #define UID_NAME_LEN        50
 #define UID_VERSION_LEN     16
 
+// Satu record UID lokal. Format UID berupa string hex agar mudah disimpan ke JSON.
 typedef struct {
     char     uid[UID_HEX_LEN];       // 8-char hex string + null terminator
     char     name[UID_NAME_LEN];     // Human-readable name
@@ -17,6 +20,7 @@ typedef struct {
     uint32_t rolling_state;          // Current rolling token state
 } UIDEntry;
 
+// Database lokal berbasis array tetap; tidak ada vector/alokasi dinamis di struct.
 typedef struct {
     UIDEntry entries[MAX_UID_ENTRIES];
     int      count;
